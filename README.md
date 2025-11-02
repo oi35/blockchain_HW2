@@ -147,15 +147,21 @@ function mintTicket(
     address to,
     uint256 activityId,
     uint256 choice,
-    uint256 price
+    uint256 price,
+    uint256 odds
 ) external onlyEasyBet returns (uint256) {
     uint256 tokenId = _tokenIdCounter;
     _tokenIdCounter++;
+
     _safeMint(to, tokenId);
-    // 记录彩票信息
+
     tokenToActivity[tokenId] = activityId;
     tokenToChoice[tokenId] = choice;
     tokenPrice[tokenId] = price;
+    tokenOdds[tokenId] = odds;
+
+    emit TicketMinted(tokenId, to, activityId, choice, price, odds);
+
     return tokenId;
 }
 ```
@@ -164,23 +170,42 @@ function mintTicket(
 
 #### 3.1 创建竞猜活动
 
-公证人可以创建竞猜活动，需要提供奖池资金。
+公证人可以创建竞猜活动
 
 ```solidity
 function createActivity(
     string memory name,
     string[] memory choices,
-    uint256 prizePool,
-    uint256 ticketPrice,
+    uint256[] memory odds,
     uint256 duration
 ) external returns (uint256) {
-    // 从公证人账户转移奖池资金
-    require(
-        betToken.transferFrom(msg.sender, address(this), prizePool),
-        "Prize pool transfer failed"
+    require(choices.length >= 2, "At least 2 choices required");
+    require(choices.length == odds.length, "Choices and odds length mismatch");
+    require(duration > 0, "Duration must be positive");
+    // 验证赔率有效性（每个赔率应该 >= 100，即至少1.0倍）
+    for (uint256 i = 0; i < odds.length; i++) {
+        require(odds[i] >= 100, "Odds must be at least 100 (1.0x)");
+    }
+    uint256 activityId = _activityIdCounter;
+    _activityIdCounter++;
+    Activity storage activity = activities[activityId];
+    activity.id = activityId;
+    activity.creator = msg.sender;
+    activity.name = name;
+    activity.choices = choices;
+    activity.odds = odds;
+    activity.totalPool = 0; // 初始对赌池为0
+    activity.deadline = block.timestamp + duration;
+    activity.settled = false;
+    activity.createdAt = block.timestamp;
+    emit ActivityCreated(
+        activityId,
+        msg.sender,
+        name,
+        odds,
+        activity.deadline
     );
-    // 创建活动记录
-    // ...
+    return activityId;
 }
 ```
 
@@ -189,28 +214,42 @@ function createActivity(
 玩家使用BET Token购买彩票，获得ERC721 NFT作为凭证。
 
 ```solidity
-function buyTicket(uint256 activityId, uint256 choice) external returns (uint256) {
+function buyTicket(uint256 activityId, uint256 choice, uint256 amount) externareturns (uint256) {
     Activity storage activity = activities[activityId];
-    // 验证活动状态
+    require(activity.creator != address(0), "Activity does not exist");
     require(block.timestamp < activity.deadline, "Activity expired");
     require(!activity.settled, "Activity already settled");
+    require(choice < activity.choices.length, "Invalid choice");
+    require(amount > 0, "Amount must be positive");
 
-    // 扣除BET Token
+    // 扣除用户的BET Token
     require(
-        betToken.transferFrom(msg.sender, address(this), activity.ticketPrice),
+        betToken.transferFrom(msg.sender, address(this), amount),
         "Payment failed"
     );
 
-    // 增加奖池
-    activity.prizePool += activity.ticketPrice;
+    // 加入对赌池
+    activity.totalPool += amount;
+    choiceAmounts[activityId][choice] += amount;
 
-    // 铸造彩票NFT
+    // 获取当前选项的赔率并锁定到彩票上
+    uint256 lockedOdds = activity.odds[choice];
+
+    // 铸造彩票NFT（含锁定赔率）
     uint256 ticketId = lotteryTicket.mintTicket(
-        msg.sender, activityId, choice, activity.ticketPrice
+        msg.sender,
+        activityId,
+        choice,
+        amount,
+        lockedOdds
     );
 
-    // 记录购买信息（用于结算）
+    // 记录购买信息
+    activityChoiceCount[activityId][choice]++;
     activityChoiceBuyers[activityId][choice].push(msg.sender);
+    choiceTickets[activityId][choice].push(ticketId); // 记录彩票ID
+
+    emit TicketPurchased(activityId, ticketId, msg.sender, choice, amount, lockedOdds);
 
     return ticketId;
 }
@@ -223,9 +262,18 @@ function buyTicket(uint256 activityId, uint256 choice) external returns (uint256
 **创建订单**：
 ```solidity
 function createOrder(uint256 ticketId, uint256 price) external returns (uint256) {
+    require(price > 0, "Price must be positive");
     require(lotteryTicket.ownerOf(ticketId) == msg.sender, "Not ticket owner");
-
-    uint256 orderId = _orderIdCounter++;
+    require(!ticketInOrder[ticketId], "Ticket already in order"); // 防止重复挂单
+    // 获取彩票信息
+    (uint256 activityId, , , , ) = lotteryTicket.getTicketInfo(ticketId);
+    Activity storage activity = activities[activityId];
+    require(block.timestamp < activity.deadline, "Activity expired");
+    require(!activity.settled, "Activity already settled");
+    // 将彩票授权给合约（用于后续交易）
+    // 注意：用户需要先调用 lotteryTicket.approve(address(this), ticketId)
+    uint256 orderId = _orderIdCounter;
+    _orderIdCounter++;
     orders[orderId] = Order({
         id: orderId,
         seller: msg.sender,
@@ -234,9 +282,33 @@ function createOrder(uint256 ticketId, uint256 price) external returns (uint256)
         active: true,
         createdAt: block.timestamp
     });
-
     activityOrders[activityId].push(orderId);
+    ticketInOrder[ticketId] = true; // 标记彩票正在挂单中
+    emit OrderCreated(orderId, ticketId, msg.sender, price);
     return orderId;
+}
+
+**撤回订单**：
+```solidity
+function cancelOrder(uint256 orderId) external {
+    Order storage order = orders[orderId];
+    require(order.active, "Order not active");
+    require(order.seller == msg.sender, "Not order owner");
+    order.active = false;
+    ticketInOrder[order.ticketId] = false; // 清除挂单标记
+    emit OrderCancelled(orderId);
+}
+
+**修改订单**：
+```solidity
+function updateOrderPrice(uint256 orderId, uint256 newPrice) external {
+    Order storage order = orders[orderId];
+    require(order.active, "Order not active");
+    require(order.seller == msg.sender, "Not order owner");
+    require(newPrice > 0, "Price must be positive");
+    uint256 oldPrice = order.price;
+    order.price = newPrice;
+    emit OrderPriceUpdated(orderId, order.ticketId, oldPrice, newPrice);
 }
 ```
 
@@ -245,17 +317,23 @@ function createOrder(uint256 ticketId, uint256 price) external returns (uint256)
 function fillOrder(uint256 orderId) external {
     Order storage order = orders[orderId];
     require(order.active, "Order not active");
-
+    // 获取彩票信息
+    uint256 ticketId = order.ticketId;
+    (uint256 activityId, , , , ) = lotteryTicket.getTicketInfo(ticketId);
+    Activity storage activity = activities[activityId];
+    require(block.timestamp < activity.deadline, "Activity expired");
+    require(!activity.settled, "Activity already settled");
     // 买家支付BET Token给卖家
     require(
         betToken.transferFrom(msg.sender, order.seller, order.price),
         "Payment failed"
     );
-
     // 转移彩票NFT
-    lotteryTicket.transferFrom(order.seller, msg.sender, order.ticketId);
-
+    lotteryTicket.transferFrom(order.seller, msg.sender, ticketId);
+    // 标记订单为已完成
     order.active = false;
+    ticketInOrder[ticketId] = false; // 清除挂单标记
+    emit OrderFilled(orderId, ticketId, msg.sender, order.seller, order.price);
 }
 ```
 
@@ -282,24 +360,58 @@ function settleActivity(uint256 activityId, uint256 winningChoice) external {
     require(activity.creator == msg.sender, "Only creator can settle");
     require(block.timestamp >= activity.deadline, "Activity not expired yet");
     require(!activity.settled, "Already settled");
-
+    require(winningChoice < activity.choices.length, "Invalid winning choice");
     activity.settled = true;
     activity.winningChoice = winningChoice;
-
-    // 获取获胜者列表
-    address[] storage winners = activityChoiceBuyers[activityId][winningChoice];
-    uint256 totalWinners = winners.length;
-
-    if (totalWinners > 0) {
-        uint256 prizePerWinner = activity.prizePool / totalWinners;
-        // 分发奖金
+    // 获取获胜选项的所有彩票ID
+    uint256[] storage winningTickets = choiceTickets[activityId][winningChoice];
+    uint256 totalWinners = winningTickets.length;
+    if (totalWinners == 0) {
+        // 如果没有获胜者，对赌池退还给公证人
+        if (activity.totalPool > 0) {
+            betToken.transfer(activity.creator, activity.totalPool);
+        }
+        emit ActivitySettled(activityId, winningChoice, 0, 0);
+        return;
+    }
+    // 第一轮：计算总应付奖金
+    uint256 totalPayout = 0;
+    for (uint256 i = 0; i < totalWinners; i++) {
+        uint256 ticketId = winningTickets[i];
+        (, , uint256 ticketAmount, uint256 ticketOdds, ) = lotteryTicketgetTicketInfo(ticketId);
+        // 应得奖金 = 投注金额 × 赔率 / 100
+        uint256 expectedPayout = (ticketAmount * ticketOdds) / 100;
+        totalPayout += expectedPayout;
+    }
+    // 第二轮：分发奖金
+    uint256 actualTotalPaid = 0;
+    if (totalPayout <= activity.totalPool) {
+        // 对赌池足够，全额支付
         for (uint256 i = 0; i < totalWinners; i++) {
-            betToken.transfer(winners[i], prizePerWinner);
+            uint256 ticketId = winningTickets[i];
+            (, , uint256 ticketAmount, uint256 ticketOdds, address owner) =lotteryTicket.getTicketInfo(ticketId);
+            uint256 payout = (ticketAmount * ticketOdds) / 100;
+            betToken.transfer(owner, payout);
+            actualTotalPaid += payout;
+        }
+        // 剩余的对赌池退还给公证人
+        uint256 remaining = activity.totalPool - actualTotalPaid;
+        if (remaining > 0) {
+            betToken.transfer(activity.creator, remaining);
         }
     } else {
-        // 没有获胜者，退还给公证人
-        betToken.transfer(activity.creator, activity.prizePool);
+        // 对赌池不足，按比例分配
+        for (uint256 i = 0; i < totalWinners; i++) {
+            uint256 ticketId = winningTickets[i];
+            (, , uint256 ticketAmount, uint256 ticketOdds, address owner) =lotteryTicket.getTicketInfo(ticketId);
+            uint256 expectedPayout = (ticketAmount * ticketOdds) / 100;
+            // 实际获得 = 应得 × (对赌池 / 总应付)
+            uint256 actualPayout = (expectedPayout * activity.totalPool) /totalPayout;
+            betToken.transfer(owner, actualPayout);
+            actualTotalPaid += actualPayout;
+        }
     }
+    emit ActivitySettled(activityId, winningChoice, totalWinners,actualTotalPaid / totalWinners);
 }
 ```
 
@@ -311,15 +423,68 @@ function settleActivity(uint256 activityId, uint256 winningChoice) external {
 
 ```typescript
 const connectWallet = async () => {
-    const provider = new ethers.providers.Web3Provider(window.ethereum);
+  if (!(window as any).ethereum) {
+    alert('请安装MetaMask!');
+    return;
+  }
+
+  try {
+    const provider = new ethers.providers.Web3Provider((window as any).ethereum);
     await provider.send("eth_requestAccounts", []);
     const signer = provider.getSigner();
     const address = await signer.getAddress();
 
-    // 初始化合约实例
+    // 获取网络信息
+    const network = await provider.getNetwork();
+    const balance = await provider.getBalance(address);
+
+    setProvider(provider);
+    setSigner(signer);
+    setAccount(address);
+
+    // 收集调试信息
+    const debug: any = {
+      account: address,
+      ethBalance: ethers.utils.formatEther(balance),
+      chainId: network.chainId,
+      networkName: network.name,
+      contracts: CONTRACT_ADDRESSES,
+      timestamp: new Date().toLocaleString()
+    };
+
+    // 验证合约
+    try {
+      const betTokenCode = await provider.getCode(CONTRACT_ADDRESSES.BetToken);
+      const easyBetCode = await provider.getCode(CONTRACT_ADDRESSES.EasyBet);
+      const lotteryTicketCode = await provider.getCode(CONTRACT_ADDRESSES.LotteryTicket);
+
+      debug.contractsExist = {
+        BetToken: betTokenCode !== '0x',
+        EasyBet: easyBetCode !== '0x',
+        LotteryTicket: lotteryTicketCode !== '0x'
+      };
+    } catch (err) {
+      debug.contractsExist = { error: 'Unable to check' };
+    }
+
+    setDebugInfo(debug);
+    console.log('🔍 调试信息:', debug);
+
+    // 初始化合约
     const betToken = new ethers.Contract(CONTRACT_ADDRESSES.BetToken, BetTokenABI.abi, signer);
     const easyBet = new ethers.Contract(CONTRACT_ADDRESSES.EasyBet, EasyBetABI.abi, signer);
     const lotteryTicket = new ethers.Contract(CONTRACT_ADDRESSES.LotteryTicket, LotteryTicketABI.abi, signer);
+
+    setBetTokenContract(betToken);
+    setEasyBetContract(easyBet);
+    setLotteryTicketContract(lotteryTicket);
+
+    // 加载数据
+    loadUserData(betToken, easyBet, lotteryTicket, address);
+  } catch (error) {
+    console.error('连接钱包失败:', error);
+    alert('连接钱包失败: ' + (error as any).message);
+  }
 };
 ```
 
@@ -328,19 +493,45 @@ const connectWallet = async () => {
 从区块链加载活动列表、用户彩票等数据：
 
 ```typescript
-const loadUserData = async (betToken, easyBet, lotteryTicket, address) => {
-    // 获取BET余额
+const loadUserData = async (betToken: any, easyBet: any, lotteryTicket: any,address: string) => {
+  try {
     const balance = await betToken.balanceOf(address);
-
-    // 获取所有活动
+    setBetBalance(ethers.utils.formatEther(balance));
+    const canClaimTokens = await betToken.canClaim(address);
+    setCanClaim(canClaimTokens);
     const activityCount = await easyBet.getActivityCount();
+    const acts = [];
     for (let i = 0; i < activityCount; i++) {
-        const activity = await easyBet.getActivity(i);
-        // 处理活动数据
+      const activity = await easyBet.getActivity(i);
+      acts.push({
+        id: activity.id.toNumber(),
+        name: activity.name,
+        creator: activity.creator,
+        choices: activity.choices,
+        odds: activity.odds.map((o: any) => o.toNumber()), // 赔率数组
+        totalPool: ethers.utils.formatEther(activity.totalPool), // 对赌池
+        deadline: new Date(activity.deadline.toNumber() * 1000),
+        settled: activity.settled,
+        winningChoice: activity.winningChoice.toNumber(),
+      });
     }
-
-    // 获取用户彩票
+    setActivities(acts);
     const tickets = await lotteryTicket.getTicketsByOwner(address);
+    const ticketDetails = [];
+    for (let tokenId of tickets) {
+      const info = await lotteryTicket.getTicketInfo(tokenId);
+      ticketDetails.push({
+        tokenId: tokenId.toNumber(),
+        activityId: info.activityId.toNumber(),
+        choice: info.choice.toNumber(),
+        price: ethers.utils.formatEther(info.price),
+        odds: info.odds.toNumber(), // 锁定的赔率
+      });
+    }
+    setMyTickets(ticketDetails);
+  } catch (error) {
+    console.error('加载数据失败:', error);
+  }
 };
 ```
 
@@ -349,62 +540,23 @@ const loadUserData = async (betToken, easyBet, lotteryTicket, address) => {
 所有涉及ERC20的操作都需要先approve：
 
 ```typescript
-const buyTicket = async (activityId, choice) => {
-    // 1. Approve ERC20
-    const approveTx = await betTokenContract.approve(
-        CONTRACT_ADDRESSES.EasyBet,
-        price
-    );
+const buyTicket = async (activityId: number, choice: number) => {
+  try {
+    // 提示用户输入投注金额
+    const amountStr = prompt('请输入投注金额（BET）:');
+    if (!amountStr) return;
+    const amount = ethers.utils.parseEther(amountStr);
+    const approveTx = await betTokenContract.approve(CONTRACT_ADDRESSES.EasyBet,amount);
     await approveTx.wait();
-
-    // 2. 购买彩票
-    const tx = await easyBetContract.buyTicket(activityId, choice);
+    const tx = await easyBetContract.buyTicket(activityId, choice, amount);
     await tx.wait();
-
-    // 3. 刷新数据
-    loadUserData(...);
+    alert('购买成功!');
+    loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+  } catch (error: any) {
+    console.error('购买失败:', error);
+    alert('购买失败: ' + error.message);
+  }
 };
-```
-
-## 合约测试
-
-项目包含完整的测试用例（14个测试全部通过）：
-
-```bash
-cd contracts
-npx hardhat test
-```
-
-测试覆盖：
-- ✓ BET Token领取功能
-- ✓ 活动创建
-- ✓ 彩票购买
-- ✓ 订单簿（创建、购买、取消）
-- ✓ 活动结算和奖金分配
-- ✓ 权限控制
-
-## 项目结构
-
-```
-ZJU-blockchain-course-2025/
-├── contracts/                 # 智能合约
-│   ├── contracts/
-│   │   ├── BetToken.sol      # ERC20积分合约
-│   │   ├── LotteryTicket.sol # ERC721彩票合约
-│   │   └── EasyBet.sol       # 主合约
-│   ├── scripts/
-│   │   └── deploy.ts         # 部署脚本
-│   ├── test/
-│   │   └── testEasyBet.ts    # 测试文件
-│   └── hardhat.config.ts     # Hardhat配置
-├── frontend/                  # 前端应用
-│   ├── src/
-│   │   ├── contracts/        # 合约ABI
-│   │   ├── App.tsx           # 主应用
-│   │   └── App.css           # 样式
-│   └── package.json
-├── copy-abis.js              # ABI复制脚本
-└── README.md                 # 本文档
 ```
 
 ## 功能演示流程
@@ -412,14 +564,13 @@ ZJU-blockchain-course-2025/
 ### 1. 公证人创建活动
 
 1. 连接MetaMask钱包
-2. 领取BET Token（如余额不足）
-3. 填写活动信息：
+2. 填写活动信息：
    - 活动名称：例如 "NBA总冠军"
    - 选项：例如 "湖人,热火,勇士"
-   - 奖池：例如 100 BET
-   - 票价：例如 10 BET
+   - 赔率：例如 "1.1,1.5,3.5"
    - 持续时间：例如 24 小时
-4. 点击"创建活动"，MetaMask会弹出两次确认（approve和create）
+3. 点击"创建活动"，MetaMask会弹出两次确认（approve和create）
+4. 可以点击调整赔率进行实时的调整
 
 ### 2. 玩家购买彩票
 
@@ -448,7 +599,7 @@ ZJU-blockchain-course-2025/
 2. 在活动卡片中选择获胜选项
 3. 点击"结算"按钮
 4. 确认交易
-5. 获胜者自动获得奖金
+5. 获胜者自动获得奖金，奖池如果有剩余则分给公证人
 
 ## 技术亮点
 
@@ -476,27 +627,6 @@ ZJU-blockchain-course-2025/
 - 实时数据更新
 - 清晰的交易反馈
 
-## 常见问题
-
-### Q: MetaMask交易失败？
-
-A: 检查以下几点：
-1. 是否连接到正确的网络（Ganache）
-2. BET余额是否充足
-3. 是否已approve足够的额度
-4. 活动是否已截止或已结算
-
-### Q: 看不到我的彩票？
-
-A: 确保：
-1. 交易已确认
-2. 刷新页面重新加载数据
-3. 使用正确的账户
-
-### Q: 如何测试结算功能？
-
-A: 创建活动时设置较短的持续时间（例如0.01小时），或在Ganache中手动增加时间。
-
 ## 参考资料
 
 - OpenZeppelin合约库：https://docs.openzeppelin.com/contracts/
@@ -506,4 +636,4 @@ A: 创建活动时设置较短的持续时间（例如0.01小时），或在Gana
 
 ## 作者
 
-浙江大学区块链课程 2025
+李明睿 浙江大学区块链课程 2025

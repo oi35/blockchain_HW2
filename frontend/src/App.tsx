@@ -143,7 +143,7 @@ function App() {
       setLotteryTicketContract(lotteryTicket);
 
       // 加载数据
-      loadUserData(betToken, easyBet, lotteryTicket, address);
+      loadUserData(betToken, easyBet, lotteryTicket, address, provider);
     } catch (error) {
       console.error('连接钱包失败:', error);
       alert('连接钱包失败: ' + (error as any).message);
@@ -151,18 +151,48 @@ function App() {
   };
 
   // 加载用户数据
-  const loadUserData = async (betToken: any, easyBet: any, lotteryTicket: any, address: string) => {
+  const loadUserData = async (betToken: any, easyBet: any, lotteryTicket: any, address: string, providerInstance: any) => {
     try {
+      console.log('🔄 Loading user data for:', address);
+
       const balance = await betToken.balanceOf(address);
       setBetBalance(ethers.utils.formatEther(balance));
 
       const canClaimTokens = await betToken.canClaim(address);
       setCanClaim(canClaimTokens);
 
+      // 获取当前区块时间（使用传入的 provider）
+      let currentBlockTime = Math.floor(Date.now() / 1000); // 默认使用本地时间
+      try {
+        if (providerInstance) {
+          const latestBlock = await providerInstance.getBlock('latest');
+          currentBlockTime = latestBlock.timestamp;
+          console.log('✅ Current blockchain time:', new Date(currentBlockTime * 1000).toLocaleString());
+        } else {
+          console.warn('⚠️ Provider not available, using local time');
+        }
+      } catch (blockError) {
+        console.warn('⚠️ Failed to get blockchain time, using local time:', blockError);
+      }
+
       const activityCount = await easyBet.getActivityCount();
+      console.log('📊 Total activities:', activityCount.toNumber());
+
       const acts = [];
       for (let i = 0; i < activityCount; i++) {
         const activity = await easyBet.getActivity(i);
+        const deadlineTimestamp = activity.deadline.toNumber();
+        const isExpired = currentBlockTime >= deadlineTimestamp;
+
+        console.log(`Activity #${i}:`, {
+          name: activity.name,
+          deadline: new Date(deadlineTimestamp * 1000).toLocaleString(),
+          deadlineTimestamp,
+          currentBlockTime,
+          isExpired,
+          settled: activity.settled
+        });
+
         acts.push({
           id: activity.id.toNumber(),
           name: activity.name,
@@ -170,14 +200,18 @@ function App() {
           choices: activity.choices,
           odds: activity.odds.map((o: any) => o.toNumber()), // 赔率数组
           totalPool: ethers.utils.formatEther(activity.totalPool), // 对赌池
-          deadline: new Date(activity.deadline.toNumber() * 1000),
+          deadline: new Date(deadlineTimestamp * 1000),
           settled: activity.settled,
           winningChoice: activity.winningChoice.toNumber(),
+          isExpired: isExpired, // 基于区块时间判断是否过期
         });
       }
       setActivities(acts);
+      console.log('✅ Loaded activities:', acts.length);
 
       const tickets = await lotteryTicket.getTicketsByOwner(address);
+      console.log('🎫 Total tickets:', tickets.length);
+
       const ticketDetails = [];
       for (let tokenId of tickets) {
         const info = await lotteryTicket.getTicketInfo(tokenId);
@@ -190,8 +224,10 @@ function App() {
         });
       }
       setMyTickets(ticketDetails);
+      console.log('✅ Loaded tickets:', ticketDetails.length);
+      console.log('✅ All user data loaded successfully!');
     } catch (error) {
-      console.error('加载数据失败:', error);
+      console.error('❌ 加载数据失败:', error);
     }
   };
 
@@ -201,7 +237,7 @@ function App() {
       const tx = await betTokenContract.claimTokens();
       await tx.wait();
       alert('成功领取1000 BET Token!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
     } catch (error: any) {
       console.error('领取失败:', error);
       alert('领取失败: ' + error.message);
@@ -227,7 +263,7 @@ function App() {
       const tx = await easyBetContract.createActivity(name, choices, odds, duration);
       await tx.wait();
       alert('活动创建成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
       form.reset();
     } catch (error: any) {
       console.error('创建活动失败:', error);
@@ -250,7 +286,7 @@ function App() {
       const tx = await easyBetContract.buyTicket(activityId, choice, amount);
       await tx.wait();
       alert('购买成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
     } catch (error: any) {
       console.error('购买失败:', error);
       alert('购买失败: ' + error.message);
@@ -283,7 +319,7 @@ function App() {
       const tx = await easyBetContract.createOrder(ticketId, ethers.utils.parseEther(price));
       await tx.wait();
       alert('订单创建成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
     } catch (error: any) {
       console.error('创建订单失败:', error);
       alert('创建订单失败: ' + error.message);
@@ -300,7 +336,7 @@ function App() {
       const tx = await easyBetContract.fillOrder(orderId);
       await tx.wait();
       alert('购买成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
       if (selectedActivity !== null) {
         viewOrderBook(selectedActivity);
       }
@@ -338,7 +374,7 @@ function App() {
       const tx = await easyBetContract.cancelOrder(orderId);
       await tx.wait();
       alert('订单已撤回!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
       if (selectedActivity !== null) {
         viewOrderBook(selectedActivity);
       }
@@ -354,7 +390,7 @@ function App() {
       const tx = await easyBetContract.settleActivity(activityId, winningChoice);
       await tx.wait();
       alert('结算成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
     } catch (error: any) {
       console.error('结算失败:', error);
       alert('结算失败: ' + error.message);
@@ -379,10 +415,51 @@ function App() {
       const tx = await easyBetContract.updateOdds(activityId, newOdds);
       await tx.wait();
       alert('赔率修改成功!');
-      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account);
+      loadUserData(betTokenContract, easyBetContract, lotteryTicketContract, account, provider);
     } catch (error: any) {
       console.error('修改赔率失败:', error);
       alert('修改赔率失败: ' + error.message);
+    }
+  };
+
+  // 显示推进时间提示
+  const showAdvanceTimeHint = async (activityId: number) => {
+    try {
+      const activity = activities.find(a => a.id === activityId);
+      if (!activity) return;
+
+      // 获取当前区块时间
+      if (!provider) {
+        alert('请先连接钱包！');
+        return;
+      }
+
+      const latestBlock = await provider.getBlock('latest');
+      const currentBlockTime = latestBlock.timestamp;
+      const deadline = Math.floor(activity.deadline.getTime() / 1000);
+
+      if (currentBlockTime >= deadline) {
+        alert('活动已经过期，可以直接结算！');
+        return;
+      }
+
+      const timeDiff = deadline - currentBlockTime;
+
+      alert(
+        `📌 活动还未到期，需要推进时间\n\n` +
+        `当前区块时间: ${new Date(currentBlockTime * 1000).toLocaleString()}\n` +
+        `活动截止时间: ${activity.deadline.toLocaleString()}\n` +
+        `需要等待: 约 ${Math.ceil(timeDiff / 60)} 分钟\n\n` +
+        `⏩ 快速推进时间（仅限Ganache测试）：\n\n` +
+        `打开终端，执行以下命令：\n\n` +
+        `cd contracts\n` +
+        `npx hardhat run scripts/advance-time.ts --network ganache\n\n` +
+        `执行后刷新页面即可结算活动。\n\n` +
+        `💡 提示：也可以创建持续时间很短的活动进行测试（例如 0.01 小时）`
+      );
+    } catch (error: any) {
+      console.error('显示推进时间提示失败:', error);
+      alert('获取区块信息失败。\n\n请直接使用命令行推进时间：\n\ncd contracts\nnpx hardhat run scripts/advance-time.ts --network ganache');
     }
   };
 
@@ -498,9 +575,37 @@ function App() {
                 {activities.map(activity => (
                   <div key={activity.id} className="activity-card">
                     <h3>{activity.name}</h3>
-                    <p>状态: {activity.settled ? `已结算 (获胜选项: ${activity.choices[activity.winningChoice]})` : '进行中'}</p>
+                    <p>
+                      状态: {
+                        activity.settled
+                          ? `已结算 (获胜选项: ${activity.choices[activity.winningChoice]})`
+                          : activity.isExpired
+                            ? <span style={{ color: '#ff9800', fontWeight: 'bold' }}>⏰ 已过期，等待结算</span>
+                            : <span style={{ color: '#4caf50' }}>✅ 进行中</span>
+                      }
+                    </p>
                     <p>对赌池: {parseFloat(activity.totalPool).toFixed(2)} BET</p>
-                    <p>截止: {activity.deadline.toLocaleString()}</p>
+                    <p>
+                      截止: {activity.deadline.toLocaleString()}
+                      {!activity.settled && activity.isExpired && (
+                        <span style={{ color: '#ff9800', marginLeft: '10px' }}>(可以结算了)</span>
+                      )}
+                    </p>
+                    {/* 调试信息 */}
+                    <details style={{ fontSize: '12px', color: '#666', marginTop: '10px' }}>
+                      <summary style={{ cursor: 'pointer' }}>🔍 调试信息</summary>
+                      <div style={{ marginTop: '5px', paddingLeft: '10px' }}>
+                        <p>活动ID: {activity.id}</p>
+                        <p>创建者: {activity.creator}</p>
+                        <p>当前账户: {account}</p>
+                        <p>是创建者: {account.toLowerCase() === activity.creator.toLowerCase() ? '是' : '否'}</p>
+                        <p>已结算: {activity.settled ? '是' : '否'}</p>
+                        <p>已过期: {activity.isExpired ? '是' : '否'}</p>
+                        <p style={{ color: activity.isExpired && !activity.settled && account.toLowerCase() === activity.creator.toLowerCase() ? '#4caf50' : '#f44336' }}>
+                          应该显示结算按钮: {activity.isExpired && !activity.settled && account.toLowerCase() === activity.creator.toLowerCase() ? '是 ✅' : '否 ❌'}
+                        </p>
+                      </div>
+                    </details>
                     <div className="choices" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '10px', margin: '15px 0' }}>
                       {activity.choices.map((choice: string, index: number) => (
                         <div key={index} style={{ border: '1px solid #ddd', padding: '10px', borderRadius: '8px', background: '#f9f9f9' }}>
@@ -510,7 +615,7 @@ function App() {
                           </div>
                           <button
                             onClick={() => buyTicket(activity.id, index)}
-                            disabled={activity.settled || new Date() > activity.deadline}
+                            disabled={activity.settled || activity.isExpired}
                             className="choice-btn"
                             style={{ width: '100%' }}
                           >
@@ -523,12 +628,17 @@ function App() {
                       <button onClick={() => viewOrderBook(activity.id)} className="view-orders-btn">
                         查看订单簿
                       </button>
-                      {account.toLowerCase() === activity.creator.toLowerCase() && !activity.settled && new Date() < activity.deadline && (
-                        <button onClick={() => updateOdds(activity.id)} className="update-odds-btn" style={{ marginLeft: '10px' }}>
-                          修改赔率
-                        </button>
+                      {account.toLowerCase() === activity.creator.toLowerCase() && !activity.settled && !activity.isExpired && (
+                        <>
+                          <button onClick={() => updateOdds(activity.id)} className="update-odds-btn" style={{ marginLeft: '10px' }}>
+                            修改赔率
+                          </button>
+                          <button onClick={() => showAdvanceTimeHint(activity.id)} className="advance-time-btn" style={{ marginLeft: '10px', background: '#ff9800' }}>
+                            ⏩ 如何推进时间
+                          </button>
+                        </>
                       )}
-                      {account.toLowerCase() === activity.creator.toLowerCase() && !activity.settled && new Date() > activity.deadline && (
+                      {account.toLowerCase() === activity.creator.toLowerCase() && !activity.settled && activity.isExpired && (
                         <div className="settle-section">
                           <select id={`winning-${activity.id}`} className="settle-select">
                             {activity.choices.map((choice: string, index: number) => (
@@ -621,7 +731,7 @@ function App() {
                       <p style={{ color: '#667eea', fontWeight: 'bold' }}>
                         潜在收益: {potentialPayout} BET
                       </p>
-                      {activity && !activity.settled && new Date() < activity.deadline && (
+                      {activity && !activity.settled && !activity.isExpired && (
                         <button
                           onClick={() => {
                             const price = prompt('设置出售价格（BET）:');

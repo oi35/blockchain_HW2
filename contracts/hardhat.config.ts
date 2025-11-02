@@ -2,23 +2,13 @@ import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
 
 const config: HardhatUserConfig = {
-  solidity: {
-    version: "0.8.20",
-    settings: {
-      optimizer: {
-        enabled: true,
-        runs: 200
-      }
-    }
-  },
+  solidity: "0.8.20",
   networks: {
     ganache: {
-      // Ganache GUI RPC URL - 根据你的Ganache实际端口调整
-      url: 'http://127.0.0.1:8545',  // 如果是7545端口
+      // Ganache GUI RPC URL - 根据Ganache实际端口调整
+      url: 'http://127.0.0.1:8545',  
       // Ganache GUI 的 Network ID
-      chainId: 1337,  // 或者5777，根据Ganache显示
-      gas: 12000000,  // 增加gas限制
-      gasPrice: 20000000000,  // 20 gwei
+      chainId: 1337,  //根据Ganache显示
       // 部署账户的私钥
       accounts: [
         '0x7e873a199ee061b5c85730f4dfea9b46da3bca3ba9b7cf7bc2adbbbd2796466b',
